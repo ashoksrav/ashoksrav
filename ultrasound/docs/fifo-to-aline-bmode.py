@@ -12,8 +12,8 @@ scipy is NOT used (32-bit lab Python friendly).
 
 Examples:
   python fifo-to-aline-bmode.py --demo --out ./ultrasound_output
-  python fifo-to-aline-bmode.py live.csv --out ./ultrasound_output
-  python fifo-to-aline-bmode.py ./fifo_folder --out ./ultrasound_output
+  python fifo-to-aline-bmode.py live.csv --out ./ultrasound_output --display sector
+  python fifo-to-aline-bmode.py ./fifo_folder --out ./ultrasound_output --display rect
   python fifo-to-aline-bmode.py --live --out ./ultrasound_output   # Windows + DLL
 """
 
@@ -44,6 +44,12 @@ DEFAULT_OUT_DIR = "ultrasound_output"
 #   "keep"  — keep every decoded sample (default; safest until layout is locked)
 #   "drop"  — if consecutive raw words match, keep only the first of each pair
 DEFAULT_DEDUPE = "keep"
+
+# Display / scan conversion
+DEFAULT_DISPLAY = "sector"  # clinical fan; use "rect" for A-line strip stack
+DEFAULT_SECTOR_DEG = 80.0
+DEFAULT_IMAGE_WIDTH = 640
+DEFAULT_IMAGE_HEIGHT = 640
 
 
 # ---------------------------------------------------------------------------
@@ -355,19 +361,21 @@ def make_synthetic_capture(
             code = np.full(n_samples, 2048, dtype=np.int32)
             captures[fifo] = (code << 4).astype(np.uint16)
             continue
-        # Carrier ~5 MHz pulsed echoes
+        # Carrier ~5 MHz: strong near-field main bang, then weaker tissue echoes
+        # (shape inspired by lab VisualAnalog RF: bang then sparse returns).
         fc = 5.0e6
-        rf = 0.05 * rng.standard_normal(n_samples)
-        # Two or three Gaussian-enveloped bursts at channel-dependent depth
-        centers = [0.12 + 0.02 * (fifo % 4), 0.28 + 0.015 * (fifo % 4)]
+        rf = 0.03 * rng.standard_normal(n_samples)
+        bang_w = max(int(0.004 * n_samples), 1)
+        bang = np.exp(-0.5 * (np.arange(n_samples) / bang_w) ** 2)
+        rf += 1.0 * bang * np.sin(2 * np.pi * fc * t)
+        centers = [0.18 + 0.02 * (fifo % 4), 0.35 + 0.015 * (fifo % 4)]
         if fifo in (6, 7):
-            centers.append(0.40)
-        for c_frac, amp in zip(centers, (0.9, 0.55, 0.35)):
+            centers.append(0.55)
+        for c_frac, amp in zip(centers, (0.35, 0.22, 0.15)):
             c = int(c_frac * n_samples)
-            width = int(0.008 * n_samples)
+            width = int(0.01 * n_samples)
             env = np.exp(-0.5 * ((np.arange(n_samples) - c) / max(width, 1)) ** 2)
             rf += amp * env * np.sin(2 * np.pi * fc * t)
-        # Scale into ~12-bit offset-binary range and pack into bits 15:4
         peak = np.max(np.abs(rf)) or 1.0
         code = np.clip(np.round(2048 + (rf / peak) * 1800), 0, 4095).astype(np.int32)
         captures[fifo] = ((code << 4) & 0xFFF0).astype(np.uint16)
@@ -442,35 +450,125 @@ def form_alines(
     return rf_m, env_m, meta
 
 
-def save_png_grayscale(path: Path, image01: np.ndarray) -> None:
-    """Write an 8-bit grayscale PNG. Prefer matplotlib; fallback to pure zlib."""
+def scan_convert_sector(
+    env_log: np.ndarray,
+    sector_deg: float = DEFAULT_SECTOR_DEG,
+    width: int = DEFAULT_IMAGE_WIDTH,
+    height: int = DEFAULT_IMAGE_HEIGHT,
+    apex_y_frac: float = 0.02,
+) -> np.ndarray:
+    """
+    Polar → Cartesian scan conversion (phased/convex-style sector).
+
+    env_log: (n_lines, n_samples) log-compressed envelopes in [0, 1],
+             sample 0 = near field (toward apex).
+    Returns (height, width) float image in [0, 1]; outside the sector is 0 (black).
+
+    Lines sit at equal angles across ±sector_deg/2 about vertical-down.
+    With only a few lines (e.g. 4 FIFOs), angular bilinear fill gives a coarse
+    fan — correct clinical *format*, not a dense commercial A4C frame.
+    """
+    env = np.asarray(env_log, dtype=np.float64)
+    if env.ndim != 2:
+        raise ValueError("env_log must be (n_lines, n_samples)")
+    n_lines, n_samples = env.shape
+    if n_lines < 1 or n_samples < 2:
+        return np.zeros((height, width), dtype=np.float64)
+
+    half = np.deg2rad(0.5 * abs(sector_deg))
+    if n_lines == 1:
+        line_angles = np.array([0.0], dtype=np.float64)
+    else:
+        line_angles = np.linspace(-half, half, n_lines, dtype=np.float64)
+
+    apex_x = 0.5 * (width - 1)
+    apex_y = float(apex_y_frac) * (height - 1)
+    max_r = max(height - 1 - apex_y, 1.0)
+
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float64)
+    dx = xx - apex_x
+    dy = yy - apex_y
+    radius = np.sqrt(dx * dx + dy * dy)
+    # 0 = straight down from apex; +theta = right
+    theta = np.arctan2(dx, dy)
+
+    inside = (dy >= 0.0) & (np.abs(theta) <= half + 1e-9) & (radius <= max_r) & (
+        radius > 1e-6
+    )
+
+    sample_f = (radius / max_r) * (n_samples - 1)
+    if n_lines == 1:
+        line_f = np.zeros_like(theta)
+    else:
+        line_f = (theta - line_angles[0]) / (line_angles[-1] - line_angles[0]) * (
+            n_lines - 1
+        )
+
+    out = np.zeros((height, width), dtype=np.float64)
+    if not np.any(inside):
+        return out
+
+    lf = np.clip(line_f[inside], 0.0, n_lines - 1 - 1e-9)
+    sf = np.clip(sample_f[inside], 0.0, n_samples - 1 - 1e-9)
+    l0 = np.floor(lf).astype(np.int64)
+    s0 = np.floor(sf).astype(np.int64)
+    l1 = np.minimum(l0 + 1, n_lines - 1)
+    s1 = np.minimum(s0 + 1, n_samples - 1)
+    al = lf - l0
+    as_ = sf - s0
+
+    v00 = env[l0, s0]
+    v01 = env[l0, s1]
+    v10 = env[l1, s0]
+    v11 = env[l1, s1]
+    vals = (
+        v00 * (1.0 - al) * (1.0 - as_)
+        + v01 * (1.0 - al) * as_
+        + v10 * al * (1.0 - as_)
+        + v11 * al * as_
+    )
+    out[inside] = np.clip(vals, 0.0, 1.0)
+    return out
+
+
+def save_png_grayscale(
+    path: Path,
+    image01: np.ndarray,
+    *,
+    annotate: bool = False,
+    title: str = "B-mode",
+) -> None:
+    """
+    Write an 8-bit grayscale PNG (clinical look: pure pixels, black=0).
+
+    annotate=True optionally wraps matplotlib axes (useful for rect debug strips).
+    """
     img = np.clip(np.asarray(image01, dtype=np.float64), 0.0, 1.0)
-    # Display: scan-line (channel) horizontal, depth vertical (row 0 = near)
-    # Shape expected: (n_depth, n_lines) for imshow-like orientation
     if img.ndim != 2:
         raise ValueError("image must be 2-D")
-    u8 = (img * 255.0).astype(np.uint8)
+    u8 = (img * 255.0 + 0.5).astype(np.uint8)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import matplotlib
 
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    if annotate:
+        try:
+            import matplotlib
 
-        fig, ax = plt.subplots(figsize=(6, 8))
-        ax.imshow(u8, cmap="gray", aspect="auto", interpolation="nearest")
-        ax.set_xlabel("scan line (FIFO channel)")
-        ax.set_ylabel("sample (depth ↑ near field at top)")
-        ax.set_title("4-ch B-mode")
-        fig.tight_layout()
-        fig.savefig(str(path), dpi=150)
-        plt.close(fig)
-        return
-    except Exception:
-        pass
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
 
-    # Minimal PNG writer (grayscale, no filtering beyond None)
+            fig, ax = plt.subplots(figsize=(6, 8))
+            ax.imshow(u8, cmap="gray", aspect="auto", interpolation="nearest")
+            ax.set_xlabel("scan line")
+            ax.set_ylabel("sample (near at top)")
+            ax.set_title(title)
+            fig.tight_layout()
+            fig.savefig(str(path), dpi=150, facecolor="black")
+            plt.close(fig)
+            return
+        except Exception:
+            pass
+
     height, width = u8.shape
     raw = b"".join(b"\x00" + u8[r].tobytes() for r in range(height))
 
@@ -514,38 +612,72 @@ def run_pipeline(
     fifo_channels: Sequence[int],
     dedupe: str,
     save_csv: bool,
+    display: str = DEFAULT_DISPLAY,
+    sector_deg: float = DEFAULT_SECTOR_DEG,
+    image_width: int = DEFAULT_IMAGE_WIDTH,
+    image_height: int = DEFAULT_IMAGE_HEIGHT,
 ) -> dict:
     rf_m, env_m, meta = form_alines(
         captures, fifo_channels, dedupe, dynamic_range_db
     )
-    # B-mode image: depth × scan-line
-    bmode = env_m.T  # (n_samples, n_ch)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rectangular stack always available for debug
+    bmode_rect = env_m.T  # (n_samples, n_ch)
+    save_png_grayscale(out_dir / "bmode_rect.png", bmode_rect)
+
+    # Clinical sector (polar scan conversion)
+    bmode_sector = scan_convert_sector(
+        env_m,
+        sector_deg=sector_deg,
+        width=image_width,
+        height=image_height,
+    )
+    sector_path = out_dir / "bmode_sector.png"
+    save_png_grayscale(sector_path, bmode_sector)
+
+    display = (display or DEFAULT_DISPLAY).lower().strip()
+    if display not in ("sector", "rect"):
+        raise ValueError("--display must be 'sector' or 'rect'")
+
     png_path = out_dir / "bmode.png"
-    save_png_grayscale(png_path, bmode)
+    if display == "sector":
+        save_png_grayscale(png_path, bmode_sector)
+        primary = bmode_sector
+    else:
+        save_png_grayscale(png_path, bmode_rect)
+        primary = bmode_rect
 
     depth = depth_axis_m(env_m.shape[1], fs_hz, sound_speed)
     np.save(str(out_dir / "rf_signed.npy"), rf_m)
     np.save(str(out_dir / "envelope_log.npy"), env_m)
     np.save(str(out_dir / "depth_m.npy"), depth)
+    np.save(str(out_dir / "bmode_sector.npy"), bmode_sector)
 
     csv_path = None
     if save_csv:
         csv_path = out_dir / "envelopes.csv"
         save_envelopes_csv(csv_path, env_m, fifo_channels)
 
-    # Per-channel A-line PNGs (optional visual check)
     for i, fifo in enumerate(fifo_channels):
-        # 1 × N looks odd; make a strip
-        strip = np.tile(env_m[i : i + 1, :], (32, 1)).T  # depth × 32
+        strip = np.tile(env_m[i : i + 1, :], (32, 1)).T
         save_png_grayscale(out_dir / f"aline_fifo_{fifo}.png", strip)
+
+    meta = dict(meta)
+    meta["display"] = display
+    meta["sector_deg"] = float(sector_deg)
+    meta["image_size"] = (int(image_width), int(image_height))
+    meta["sector_nonzero_frac"] = float(np.mean(bmode_sector > 0))
 
     result = {
         "png": str(png_path),
+        "png_sector": str(sector_path),
+        "png_rect": str(out_dir / "bmode_rect.png"),
         "csv": str(csv_path) if csv_path else None,
         "n_samples": int(env_m.shape[1]),
         "n_channels": int(env_m.shape[0]),
         "depth_max_m": float(depth[-1]) if depth.size else 0.0,
+        "primary_shape": tuple(int(x) for x in primary.shape),
         "meta": meta,
     }
     return result
@@ -630,6 +762,31 @@ def build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_SAMPLE_COUNT,
         help=f"live/demo sample count (default {DEFAULT_SAMPLE_COUNT})",
     )
+    p.add_argument(
+        "--display",
+        choices=("sector", "rect"),
+        default=DEFAULT_DISPLAY,
+        help="primary bmode.png layout: clinical sector fan (default) or "
+        "rectangular A-line stack",
+    )
+    p.add_argument(
+        "--sector-deg",
+        type=float,
+        default=DEFAULT_SECTOR_DEG,
+        help=f"sector sweep angle in degrees (default {DEFAULT_SECTOR_DEG})",
+    )
+    p.add_argument(
+        "--image-width",
+        type=int,
+        default=DEFAULT_IMAGE_WIDTH,
+        help=f"sector image width px (default {DEFAULT_IMAGE_WIDTH})",
+    )
+    p.add_argument(
+        "--image-height",
+        type=int,
+        default=DEFAULT_IMAGE_HEIGHT,
+        help=f"sector image height px (default {DEFAULT_IMAGE_HEIGHT})",
+    )
     return p
 
 
@@ -678,15 +835,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fifo_channels=fifo_channels,
         dedupe=args.dedupe,
         save_csv=args.save_csv,
+        display=args.display,
+        sector_deg=args.sector_deg,
+        image_width=args.image_width,
+        image_height=args.image_height,
     )
 
     print("\n=== B-mode complete ===")
     print(f"Channels (FIFOs): {result['meta']['channels']}")
     print(f"Duplicate-pair fractions: {result['meta']['dup_fraction']}")
     print(f"Dedupe policy: {result['meta']['dedupe']}")
+    print(f"Display: {result['meta']['display']} "
+          f"(sector {result['meta']['sector_deg']}°, "
+          f"size {result['meta']['image_size']})")
     print(f"Samples: {result['n_samples']}")
     print(f"Max depth (provisional): {result['depth_max_m']*1e3:.2f} mm")
-    print(f"B-mode PNG: {result['png']}")
+    print(f"B-mode PNG (primary): {result['png']}")
+    print(f"Sector PNG: {result['png_sector']}")
+    print(f"Rect PNG: {result['png_rect']}")
     if result["csv"]:
         print(f"Envelopes CSV: {result['csv']}")
     return 0

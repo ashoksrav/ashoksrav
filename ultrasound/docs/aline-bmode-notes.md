@@ -28,9 +28,18 @@ python fifo-to-aline-bmode.py --live --out ./ultrasound_output
 | `--dynamic-range` | `40` | Log-compress window (dB) |
 | `--fifos` | `2,3,6,7` | FIFO → B-mode scan-line map |
 | `--dedupe` | `keep` | Duplicate-pair policy |
+| `--display` | `sector` | Primary `bmode.png`: `sector` (clinical fan) or `rect` (A-line stack) |
+| `--sector-deg` | `80` | Sector sweep angle (degrees) |
+| `--image-width` / `--image-height` | `640` | Sector image size (px) |
 | `--out` | `ultrasound_output` | Output directory |
 
-Outputs: `bmode.png`, `aline_fifo_*.png`, `rf_signed.npy`, `envelope_log.npy`, `depth_m.npy`, optional `envelopes.csv`.
+Outputs: `bmode.png` (primary), `bmode_sector.png`, `bmode_rect.png`, `aline_fifo_*.png`, `rf_signed.npy`, `envelope_log.npy`, `depth_m.npy`, `bmode_sector.npy`, optional `envelopes.csv`.
+
+## Sector / clinical display
+
+Default display is a **grayscale sector (fan)** via polar scan conversion: each log-compressed A-line is a ray from an apex at the top; rays span `--sector-deg` about vertical-down; bilinear interpolate in (line, depth); outside the sector is black.
+
+Honest constraint: with only **4 channels** (and/or manual probe motion) this matches the clinical *format* of an apical/phased view, **not** a commercial A4C frame. Dense anatomy needs many more steering angles or channels later. Use `--display rect` when you want the raw rectangular A-line stack for debug.
 
 ## Decode assumptions
 
